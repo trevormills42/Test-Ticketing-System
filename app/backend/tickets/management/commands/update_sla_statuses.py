@@ -6,24 +6,26 @@ from tickets.models import Ticket
 
 class Command(BaseCommand):
     help = (
-        'Recomputes sla_breached and sla_warning for all open tickets. '
-        'Run on a schedule (e.g. every 5 minutes via cron or Celery Beat) so '
-        'tickets that have not been saved recently stay accurate.'
+        'Recomputes sla_breached and sla_warning for all open tickets and sends '
+        'escalation emails on first breach. Run on a schedule (e.g. every 5 minutes).'
     )
 
     def handle(self, *args, **options):
+        from api.emails import send_sla_escalation
+
         now = timezone.now()
 
         active_tickets = (
             Ticket.objects
             .filter(sla_deadline__isnull=False)
             .exclude(status__in=['resolved', 'closed'])
-            .select_related('sla_config')
+            .select_related('sla_config', 'assigned_to__user')
         )
 
         newly_breached = []
         newly_warned = []
         to_clear = []
+        to_escalate = []
 
         for ticket in active_tickets:
             should_breach = now > ticket.sla_deadline
@@ -37,12 +39,13 @@ class Command(BaseCommand):
 
             if should_breach and not ticket.sla_breached:
                 newly_breached.append(ticket.pk)
+                if not ticket.sla_escalation_sent:
+                    to_escalate.append(ticket)
             elif should_warn and not ticket.sla_warning and not ticket.sla_breached:
                 newly_warned.append(ticket.pk)
             elif not should_breach and not should_warn and (ticket.sla_breached or ticket.sla_warning):
                 to_clear.append(ticket.pk)
 
-        # Use update() to avoid triggering save() signals or extra overhead
         breached_count = Ticket.objects.filter(pk__in=newly_breached).update(
             sla_breached=True, sla_warning=False
         )
@@ -51,9 +54,18 @@ class Command(BaseCommand):
             sla_breached=False, sla_warning=False
         )
 
+        escalated_count = 0
+        for ticket in to_escalate:
+            send_sla_escalation(ticket)
+            escalated_count += 1
+
+        if to_escalate:
+            Ticket.objects.filter(pk__in=[t.pk for t in to_escalate]).update(sla_escalation_sent=True)
+
         self.stdout.write(
             self.style.SUCCESS(
                 f'SLA update complete: {breached_count} newly breached, '
-                f'{warned_count} newly in warning, {cleared_count} cleared.'
+                f'{warned_count} newly in warning, {cleared_count} cleared, '
+                f'{escalated_count} escalation emails sent.'
             )
         )

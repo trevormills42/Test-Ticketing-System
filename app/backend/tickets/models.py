@@ -101,6 +101,7 @@ class Ticket(models.Model):
     sla_deadline = models.DateTimeField(null=True, blank=True)
     sla_breached = models.BooleanField(default=False)
     sla_warning = models.BooleanField(default=False)
+    sla_escalation_sent = models.BooleanField(default=False)
     first_responded_at = models.DateTimeField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
 
@@ -191,6 +192,48 @@ class TicketActivity(models.Model):
 
     def __str__(self):
         return f"{self.field_changed}: {self.old_value} -> {self.new_value}"
+
+
+class TicketAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    ticket = models.ForeignKey('Ticket', on_delete=models.CASCADE, related_name='attachments')
+    file = models.FileField(upload_to='attachments/%Y/%m/')
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, blank=True, default='')
+    size = models.PositiveIntegerField(default=0, help_text='File size in bytes')
+    uploaded_by = models.CharField(max_length=150, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ticket_attachments'
+        ordering = ['created_at']
+
+    def __str__(self):
+        return self.filename
+
+
+class TicketRelation(models.Model):
+    RELATION_CHOICES = [
+        ('related', 'Related To'),
+        ('blocks', 'Blocks'),
+        ('blocked_by', 'Blocked By'),
+        ('duplicates', 'Duplicates'),
+        ('duplicated_by', 'Duplicated By'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_ticket = models.ForeignKey('Ticket', on_delete=models.CASCADE, related_name='outgoing_relations')
+    to_ticket = models.ForeignKey('Ticket', on_delete=models.CASCADE, related_name='incoming_relations')
+    relation_type = models.CharField(max_length=20, choices=RELATION_CHOICES, default='related')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ticket_relations'
+        unique_together = [('from_ticket', 'to_ticket', 'relation_type')]
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.from_ticket.ticket_number} {self.relation_type} {self.to_ticket.ticket_number}"
 
 
 class CannedResponse(models.Model):

@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from datetime import timedelta
-from tickets.models import Ticket, TicketComment, TicketActivity, Agent, CannedResponse, SLAConfig
+from tickets.models import Ticket, TicketComment, TicketActivity, TicketAttachment, TicketRelation, Agent, CannedResponse, SLAConfig
 from django.contrib.auth.models import User
 
 
@@ -74,6 +74,55 @@ class TicketActivitySerializer(serializers.ModelSerializer):
                   'new_value', 'created_at']
 
 
+class TicketAttachmentSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TicketAttachment
+        fields = ['id', 'ticket', 'file', 'filename', 'content_type', 'size',
+                  'uploaded_by', 'url', 'created_at']
+        read_only_fields = ['ticket', 'created_at']
+
+    def get_url(self, obj):
+        request = self.context.get('request')
+        if request and obj.file:
+            return request.build_absolute_uri(obj.file.url)
+        return obj.file.url if obj.file else None
+
+    def create(self, validated_data):
+        file_obj = validated_data.get('file')
+        if file_obj and not validated_data.get('filename'):
+            validated_data['filename'] = file_obj.name
+        if file_obj and not validated_data.get('size'):
+            validated_data['size'] = file_obj.size
+        if file_obj and not validated_data.get('content_type'):
+            validated_data['content_type'] = getattr(file_obj, 'content_type', '')
+        return super().create(validated_data)
+
+
+class TicketRelationSerializer(serializers.ModelSerializer):
+    to_ticket_number = serializers.CharField(source='to_ticket.ticket_number', read_only=True)
+    to_ticket_title = serializers.CharField(source='to_ticket.title', read_only=True)
+    to_ticket_status = serializers.CharField(source='to_ticket.status', read_only=True)
+    from_ticket_number = serializers.CharField(source='from_ticket.ticket_number', read_only=True)
+    to_ticket_id = serializers.UUIDField(write_only=True)
+
+    class Meta:
+        model = TicketRelation
+        fields = ['id', 'from_ticket', 'from_ticket_number', 'to_ticket', 'to_ticket_id',
+                  'to_ticket_number', 'to_ticket_title', 'to_ticket_status',
+                  'relation_type', 'created_at']
+        read_only_fields = ['from_ticket', 'to_ticket', 'created_at']
+
+    def create(self, validated_data):
+        to_ticket_id = validated_data.pop('to_ticket_id')
+        try:
+            to_ticket = Ticket.objects.get(id=to_ticket_id)
+        except Ticket.DoesNotExist:
+            raise serializers.ValidationError({'to_ticket_id': 'Ticket not found.'})
+        return TicketRelation.objects.create(to_ticket=to_ticket, **validated_data)
+
+
 class TicketListSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.CharField(source='assigned_to.user.get_full_name',
                                               read_only=True, default='')
@@ -101,6 +150,8 @@ class TicketDetailSerializer(serializers.ModelSerializer):
     assigned_to_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
     comments = TicketCommentSerializer(many=True, read_only=True)
     activities = TicketActivitySerializer(many=True, read_only=True)
+    attachments = TicketAttachmentSerializer(many=True, read_only=True)
+    relations = serializers.SerializerMethodField()
     sla_config = SLAConfigSerializer(read_only=True)
     sla_status = serializers.SerializerMethodField()
     time_to_resolution = serializers.SerializerMethodField()
@@ -112,7 +163,13 @@ class TicketDetailSerializer(serializers.ModelSerializer):
                   'assigned_to', 'assigned_to_id', 'created_by', 'sla_config',
                   'sla_deadline', 'sla_breached', 'sla_warning', 'first_responded_at',
                   'resolved_at', 'source', 'tags', 'comments', 'activities',
-                  'sla_status', 'time_to_resolution', 'created_at', 'updated_at']
+                  'attachments', 'relations', 'sla_status', 'time_to_resolution',
+                  'created_at', 'updated_at']
+
+    def get_relations(self, obj):
+        outgoing = TicketRelationSerializer(obj.outgoing_relations.select_related('to_ticket'), many=True).data
+        incoming = TicketRelationSerializer(obj.incoming_relations.select_related('from_ticket', 'to_ticket'), many=True).data
+        return {'outgoing': outgoing, 'incoming': incoming}
 
     def get_sla_status(self, obj):
         return _compute_sla_status(obj.sla_deadline, obj.status, obj.sla_config if obj.sla_config_id else None)
@@ -150,14 +207,27 @@ class TicketCreateSerializer(serializers.ModelSerializer):
                   'assigned_to_id', 'source', 'tags']
 
     def create(self, validated_data):
+        from django.utils import timezone as tz
+        from datetime import timedelta
+
         assigned_to_id = validated_data.pop('assigned_to_id', None)
+
+        # Auto-assign SLA config based on priority
+        priority = validated_data.get('priority', 'medium')
+        try:
+            sla_config = SLAConfig.objects.get(priority=priority, is_active=True)
+            validated_data['sla_config'] = sla_config
+            validated_data['sla_deadline'] = tz.now() + timedelta(minutes=sla_config.resolution_time_minutes)
+        except SLAConfig.DoesNotExist:
+            pass
+
         ticket = Ticket.objects.create(**validated_data)
 
         if assigned_to_id:
             try:
                 agent = Agent.objects.get(id=assigned_to_id)
                 ticket.assigned_to = agent
-                ticket.save()
+                ticket.save(update_fields=['assigned_to'])
             except Agent.DoesNotExist:
                 pass
 
@@ -199,3 +269,35 @@ class AgentPerformanceSerializer(serializers.Serializer):
     resolved = serializers.IntegerField()
     avg_resolution_hours = serializers.FloatField()
     open_tickets = serializers.IntegerField()
+
+
+class BulkUpdateSerializer(serializers.Serializer):
+    ids = serializers.ListField(child=serializers.UUIDField(), min_length=1)
+    status = serializers.ChoiceField(choices=Ticket.STATUS_CHOICES, required=False)
+    priority = serializers.ChoiceField(choices=Ticket.PRIORITY_CHOICES, required=False)
+    assigned_to_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate(self, data):
+        if not any(k in data for k in ('status', 'priority', 'assigned_to_id')):
+            raise serializers.ValidationError('At least one of status, priority, or assigned_to_id must be provided.')
+        return data
+
+
+class TicketStatusPortalSerializer(serializers.ModelSerializer):
+    """Lightweight public serializer — no internal data."""
+    sla_status = serializers.SerializerMethodField()
+    public_comments = serializers.SerializerMethodField()
+    assigned_to_name = serializers.CharField(source='assigned_to.user.get_full_name', read_only=True, default='')
+
+    class Meta:
+        model = Ticket
+        fields = ['ticket_number', 'title', 'status', 'priority', 'ticket_type',
+                  'requester_name', 'assigned_to_name', 'sla_deadline', 'sla_status',
+                  'created_at', 'updated_at', 'public_comments']
+
+    def get_sla_status(self, obj):
+        return _compute_sla_status(obj.sla_deadline, obj.status, obj.sla_config if obj.sla_config_id else None)
+
+    def get_public_comments(self, obj):
+        public = obj.comments.filter(is_internal=False).order_by('created_at')
+        return TicketCommentSerializer(public, many=True).data

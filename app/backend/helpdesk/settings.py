@@ -1,5 +1,6 @@
 from pathlib import Path
 import environ
+import sentry_sdk
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -8,7 +9,6 @@ env = environ.Env(
     ALLOWED_HOSTS=(list, ['*']),
 )
 
-# Read .env if present; silently skip in environments that inject vars directly
 environ.Env.read_env(BASE_DIR / '.env', overwrite=False)
 
 SECRET_KEY = env('SECRET_KEY', default='django-insecure-change-me-in-production')
@@ -31,6 +31,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -58,8 +59,6 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'helpdesk.wsgi.application'
 
-# Database — set DATABASE_URL in .env (or the environment) to use PostgreSQL.
-# Falls back to SQLite for local development with no configuration required.
 DATABASES = {
     'default': env.db(
         'DATABASE_URL',
@@ -79,7 +78,12 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -100,3 +104,23 @@ REST_FRAMEWORK = {
         'rest_framework.filters.OrderingFilter',
     ],
 }
+
+# Email — default to console for local dev; set EMAIL_URL in .env for production SMTP
+EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = env('EMAIL_HOST', default='')
+EMAIL_PORT = env.int('EMAIL_PORT', default=587)
+EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=True)
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='helpdesk@example.com')
+
+SITE_URL = env('SITE_URL', default='http://localhost:3000')
+SLA_ESCALATION_EMAIL = env('SLA_ESCALATION_EMAIL', default='')
+
+# Sentry — set SENTRY_DSN in .env / environment to enable error tracking
+SENTRY_DSN = env('SENTRY_DSN', default='')
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        send_default_pii=False,
+    )

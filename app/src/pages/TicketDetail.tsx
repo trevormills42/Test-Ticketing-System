@@ -1,14 +1,14 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, Link, useNavigate } from 'react-router';
 import {
   ArrowLeft, Send, MessageSquare, History, User, Mail, Phone,
-  CheckCircle2, AlertTriangle, XCircle, Tag
+  CheckCircle2, AlertTriangle, XCircle, Tag, Paperclip, Trash2, Link2, Plus, X
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import { getTicket, getAgents, getCannedResponses, updateTicket, addTicketComment } from '@/lib/api';
+import { api, getTicket, getAgents, getCannedResponses, updateTicket, addTicketComment, uploadTicketAttachment, deleteTicketAttachment, createTicketRelation, deleteTicketRelation } from '@/lib/api';
 import { StatusBadge, PriorityBadge } from '@/components/shared/Badges';
 import {
   Select,
@@ -26,6 +26,10 @@ export default function TicketDetail() {
   const [commentText, setCommentText] = useState('');
   const [isInternal, setIsInternal] = useState(false);
   const [activeTab, setActiveTab] = useState<'comments' | 'activity'>('comments');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [newRelationTicketNumber, setNewRelationTicketNumber] = useState('');
+  const [newRelationType, setNewRelationType] = useState('related');
+  const [showRelationForm, setShowRelationForm] = useState(false);
 
   const { data: ticket, isLoading } = useQuery({
     queryKey: ['ticket', id],
@@ -63,6 +67,71 @@ export default function TicketDetail() {
       toast.success('Comment added');
     },
   });
+
+  const attachMutation = useMutation({
+    mutationFn: (formData: FormData) => uploadTicketAttachment(id!, formData),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ticket', id] });
+      toast.success('Attachment uploaded');
+    },
+    onError: () => toast.error('Upload failed'),
+  });
+
+  const deleteAttachMutation = useMutation({
+    mutationFn: (attachmentId: string) => deleteTicketAttachment(id!, attachmentId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ticket', id] });
+      toast.success('Attachment deleted');
+    },
+  });
+
+  const addRelationMutation = useMutation({
+    mutationFn: (data: { to_ticket_id: string; relation_type: string }) =>
+      createTicketRelation(id!, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ticket', id] });
+      setNewRelationTicketNumber('');
+      setShowRelationForm(false);
+      toast.success('Relation added');
+    },
+    onError: () => toast.error('Could not add relation — check ticket ID'),
+  });
+
+  const deleteRelationMutation = useMutation({
+    mutationFn: (relationId: string) => deleteTicketRelation(id!, relationId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ticket', id] });
+      toast.success('Relation removed');
+    },
+  });
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('filename', file.name);
+    fd.append('uploaded_by', 'Agent');
+    attachMutation.mutate(fd);
+    e.target.value = '';
+  };
+
+  const handleAddRelation = async () => {
+    const trimmed = newRelationTicketNumber.trim().toUpperCase();
+    if (!trimmed) return;
+    // Resolve ticket number to ID
+    try {
+      const res = await api.get('/tickets/', { params: { search: trimmed } });
+      const match = res.data.results?.find((t: { ticket_number: string; id: string }) => t.ticket_number === trimmed);
+      if (!match) {
+        toast.error('Ticket not found');
+        return;
+      }
+      addRelationMutation.mutate({ to_ticket_id: match.id, relation_type: newRelationType });
+    } catch {
+      toast.error('Error looking up ticket');
+    }
+  };
 
   const handleStatusChange = (status: string) => {
     const updates: Record<string, unknown> = { status };
@@ -232,6 +301,46 @@ export default function TicketDetail() {
                   </div>
                 </div>
               </div>
+            </CardContent>
+          </Card>
+
+          {/* Attachments */}
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-sm font-semibold text-slate-700 flex items-center gap-1.5">
+                  <Paperclip className="w-4 h-4" />
+                  Attachments ({ticket.attachments?.length || 0})
+                </CardTitle>
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => fileInputRef.current?.click()} disabled={attachMutation.isPending}>
+                  <Plus className="w-3 h-3" />
+                  {attachMutation.isPending ? 'Uploading…' : 'Upload'}
+                </Button>
+                <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
+              </div>
+            </CardHeader>
+            <CardContent className="pt-0">
+              {ticket.attachments && ticket.attachments.length > 0 ? (
+                <ul className="space-y-2">
+                  {ticket.attachments.map((att) => (
+                    <li key={att.id} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
+                      <a href={att.url} target="_blank" rel="noreferrer" className="flex items-center gap-2 text-sm text-blue-600 hover:underline truncate min-w-0">
+                        <Paperclip className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span className="truncate">{att.filename}</span>
+                        <span className="text-slate-400 text-xs flex-shrink-0">({Math.round(att.size / 1024)}KB)</span>
+                      </a>
+                      <button
+                        className="p-1 ml-2 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 flex-shrink-0"
+                        onClick={() => deleteAttachMutation.mutate(att.id)}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-slate-400 text-center py-4">No attachments</p>
+              )}
             </CardContent>
           </Card>
 
@@ -539,6 +648,91 @@ export default function TicketDetail() {
                   </div>
                 )}
               </div>
+            </CardContent>
+          </Card>
+          {/* Related Tickets */}
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-sm font-semibold text-slate-700 flex items-center gap-1.5">
+                  <Link2 className="w-4 h-4" />
+                  Related Tickets
+                </CardTitle>
+                <button
+                  className="p-1 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600"
+                  onClick={() => setShowRelationForm((v) => !v)}
+                >
+                  {showRelationForm ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                </button>
+              </div>
+            </CardHeader>
+            <CardContent className="pt-0 space-y-3">
+              {showRelationForm && (
+                <div className="flex gap-2 p-2 rounded-lg bg-slate-50 border border-slate-200">
+                  <input
+                    type="text"
+                    placeholder="TKT-00001"
+                    value={newRelationTicketNumber}
+                    onChange={(e) => setNewRelationTicketNumber(e.target.value)}
+                    className="flex-1 h-8 px-2 text-xs rounded border border-slate-200 bg-white focus:outline-none focus:border-blue-300"
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleAddRelation(); }}
+                  />
+                  <select
+                    value={newRelationType}
+                    onChange={(e) => setNewRelationType(e.target.value)}
+                    className="h-8 px-1 text-xs rounded border border-slate-200 bg-white focus:outline-none"
+                  >
+                    <option value="related">Related</option>
+                    <option value="blocks">Blocks</option>
+                    <option value="blocked_by">Blocked by</option>
+                    <option value="duplicates">Duplicates</option>
+                    <option value="duplicated_by">Duplicated by</option>
+                  </select>
+                  <Button size="sm" className="h-8 text-xs" onClick={handleAddRelation} disabled={addRelationMutation.isPending}>
+                    Add
+                  </Button>
+                </div>
+              )}
+
+              {(() => {
+                const outgoing = ticket.relations?.outgoing ?? [];
+                const incoming = ticket.relations?.incoming ?? [];
+                const all = [
+                  ...outgoing.map((r) => ({ ...r, direction: 'out' as const })),
+                  ...incoming.map((r) => ({ ...r, direction: 'in' as const })),
+                ];
+                if (all.length === 0) return <p className="text-sm text-slate-400 text-center py-3">No related tickets</p>;
+                return (
+                  <ul className="space-y-1.5">
+                    {all.map((rel) => {
+                      const label = rel.direction === 'out' ? rel.relation_type.replace('_', ' ') : `←${rel.relation_type.replace('_', ' ')}`;
+                      const linkedNumber = rel.direction === 'out' ? rel.to_ticket_number : rel.from_ticket_number;
+                      const linkedTitle = rel.direction === 'out' ? rel.to_ticket_title : '';
+                      const linkedStatus = rel.direction === 'out' ? rel.to_ticket_status : '';
+                      return (
+                        <li key={rel.id} className="flex items-center justify-between gap-2 p-2 rounded-lg hover:bg-slate-50">
+                          <div className="min-w-0">
+                            <span className="text-[10px] text-slate-400 capitalize mr-1">{label}</span>
+                            <Link to={`/tickets/${rel.direction === 'out' ? rel.to_ticket : rel.from_ticket}`} className="text-xs text-blue-600 hover:underline font-medium">
+                              {linkedNumber}
+                            </Link>
+                            {linkedTitle && <span className="text-xs text-slate-500 ml-1 truncate hidden sm:inline">— {linkedTitle}</span>}
+                            {linkedStatus && <span className="ml-1 text-[10px] px-1 py-0.5 rounded bg-slate-100 text-slate-500 capitalize">{linkedStatus}</span>}
+                          </div>
+                          {rel.direction === 'out' && (
+                            <button
+                              className="flex-shrink-0 p-1 rounded hover:bg-red-50 text-slate-300 hover:text-red-400"
+                              onClick={() => deleteRelationMutation.mutate(rel.id)}
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                );
+              })()}
             </CardContent>
           </Card>
         </div>

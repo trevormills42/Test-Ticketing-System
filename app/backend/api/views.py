@@ -1,19 +1,24 @@
 from rest_framework import generics, status, filters
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from django.db.models import Count, Q, Avg, F, ExpressionWrapper, DurationField, Case, When, Value, IntegerField
+from django.db.models import Count, Q, Avg, F, ExpressionWrapper, DurationField
 from django.utils import timezone
 from django.db.models.functions import TruncDate
 from datetime import timedelta
 
-from tickets.models import Ticket, TicketComment, TicketActivity, Agent, CannedResponse, SLAConfig
+from tickets.models import Ticket, TicketComment, TicketActivity, TicketAttachment, TicketRelation, Agent, CannedResponse, SLAConfig
 from api.serializers import (
     TicketListSerializer, TicketDetailSerializer, TicketCreateSerializer,
     TicketCommentSerializer, TicketActivitySerializer,
+    TicketAttachmentSerializer, TicketRelationSerializer,
+    BulkUpdateSerializer, TicketStatusPortalSerializer,
     AgentSerializer, CannedResponseSerializer, SLAConfigSerializer,
     DashboardStatsSerializer, TicketCountByStatusSerializer,
     TicketCountByPrioritySerializer, AgentPerformanceSerializer,
     UserSerializer
+)
+from api.emails import (
+    send_ticket_created, send_ticket_assigned, send_status_changed, send_comment_added
 )
 from django.contrib.auth.models import User
 
@@ -24,7 +29,7 @@ class TicketListCreateView(generics.ListCreateAPIView):
     queryset = Ticket.objects.all()
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['ticket_number', 'title', 'requester_name', 'requester_email', 'description']
-    ordering_fields = ['created_at', 'updated_at', 'priority', 'status']
+    ordering_fields = ['created_at', 'updated_at', 'priority', 'status', 'ticket_number']
     ordering = ['-created_at']
 
     def get_serializer_class(self):
@@ -34,32 +39,23 @@ class TicketListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         queryset = Ticket.objects.all()
-        
-        # Filter by status
+
         status_filter = self.request.query_params.get('status')
         if status_filter:
-            statuses = status_filter.split(',')
-            queryset = queryset.filter(status__in=statuses)
-        
-        # Filter by priority
+            queryset = queryset.filter(status__in=status_filter.split(','))
+
         priority_filter = self.request.query_params.get('priority')
         if priority_filter:
-            priorities = priority_filter.split(',')
-            queryset = queryset.filter(priority__in=priorities)
-        
-        # Filter by assigned agent
+            queryset = queryset.filter(priority__in=priority_filter.split(','))
+
         assigned_to = self.request.query_params.get('assigned_to')
         if assigned_to:
             queryset = queryset.filter(assigned_to__id=assigned_to)
-        
-        # Filter by ticket type
+
         ticket_type = self.request.query_params.get('ticket_type')
         if ticket_type:
             queryset = queryset.filter(ticket_type=ticket_type)
-        
-        # Filter SLA status
-        # 'breached' is computed from the live deadline; 'warning' relies on the
-        # stored flag (kept current by Ticket.save() and update_sla_statuses).
+
         sla_status = self.request.query_params.get('sla_status')
         if sla_status == 'breached':
             queryset = queryset.filter(
@@ -71,6 +67,12 @@ class TicketListCreateView(generics.ListCreateAPIView):
 
         return queryset.select_related('assigned_to__user', 'sla_config').prefetch_related('comments')
 
+    def perform_create(self, serializer):
+        ticket = serializer.save()
+        send_ticket_created(ticket)
+        if ticket.assigned_to:
+            send_ticket_assigned(ticket)
+
 
 class TicketDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Ticket.objects.all()
@@ -78,35 +80,63 @@ class TicketDetailView(generics.RetrieveUpdateDestroyAPIView):
     lookup_field = 'id'
 
     def get_queryset(self):
-        return Ticket.objects.select_related('assigned_to__user', 'sla_config').prefetch_related('comments', 'activities')
+        return Ticket.objects.select_related('assigned_to__user', 'sla_config').prefetch_related(
+            'comments', 'activities', 'attachments',
+            'outgoing_relations__to_ticket', 'incoming_relations__from_ticket', 'incoming_relations__to_ticket'
+        )
 
     def perform_update(self, serializer):
-        old_instance = self.get_object()
-        old_status = old_instance.status
-        old_assigned = old_instance.assigned_to
-        
+        old = self.get_object()
+        old_status = old.status
+        old_assigned = old.assigned_to
+        old_priority = old.priority
+        old_ticket_type = old.ticket_type
+        old_title = old.title
+        old_tags = list(old.tags)
+
         ticket = serializer.save()
-        
-        # Log activity for status change
+
+        actor = 'System'
+
         if old_status != ticket.status:
             TicketActivity.objects.create(
-                ticket=ticket,
-                actor_name='System',
-                field_changed='status',
-                old_value=old_status,
-                new_value=ticket.status
+                ticket=ticket, actor_name=actor, field_changed='status',
+                old_value=old_status, new_value=ticket.status
             )
-        
-        # Log activity for assignment change
+            send_status_changed(ticket, old_status)
+
         if old_assigned != ticket.assigned_to:
             old_name = old_assigned.user.get_full_name() if old_assigned else 'Unassigned'
             new_name = ticket.assigned_to.user.get_full_name() if ticket.assigned_to else 'Unassigned'
             TicketActivity.objects.create(
-                ticket=ticket,
-                actor_name='System',
-                field_changed='assigned_to',
-                old_value=old_name,
-                new_value=new_name
+                ticket=ticket, actor_name=actor, field_changed='assigned_to',
+                old_value=old_name, new_value=new_name
+            )
+            if ticket.assigned_to and old_assigned != ticket.assigned_to:
+                send_ticket_assigned(ticket)
+
+        if old_priority != ticket.priority:
+            TicketActivity.objects.create(
+                ticket=ticket, actor_name=actor, field_changed='priority',
+                old_value=old_priority, new_value=ticket.priority
+            )
+
+        if old_ticket_type != ticket.ticket_type:
+            TicketActivity.objects.create(
+                ticket=ticket, actor_name=actor, field_changed='ticket_type',
+                old_value=old_ticket_type, new_value=ticket.ticket_type
+            )
+
+        if old_title != ticket.title:
+            TicketActivity.objects.create(
+                ticket=ticket, actor_name=actor, field_changed='title',
+                old_value=old_title, new_value=ticket.title
+            )
+
+        if old_tags != list(ticket.tags):
+            TicketActivity.objects.create(
+                ticket=ticket, actor_name=actor, field_changed='tags',
+                old_value=', '.join(old_tags), new_value=', '.join(ticket.tags)
             )
 
 
@@ -116,20 +146,130 @@ class TicketCommentListCreateView(generics.ListCreateAPIView):
     serializer_class = TicketCommentSerializer
 
     def get_queryset(self):
-        ticket_id = self.kwargs.get('ticket_id')
-        return TicketComment.objects.filter(ticket__id=ticket_id)
+        return TicketComment.objects.filter(ticket__id=self.kwargs['ticket_id'])
 
     def perform_create(self, serializer):
-        ticket_id = self.kwargs.get('ticket_id')
-        ticket = Ticket.objects.get(id=ticket_id)
+        ticket = Ticket.objects.get(id=self.kwargs['ticket_id'])
         comment = serializer.save(ticket=ticket)
-        
-        # Update first_responded_at if this is the first response
+
         if not ticket.first_responded_at:
             ticket.first_responded_at = timezone.now()
             ticket.save(update_fields=['first_responded_at'])
-        
+
+        send_comment_added(ticket, comment)
         return comment
+
+
+# ==================== TICKET ATTACHMENTS ====================
+
+class TicketAttachmentListCreateView(generics.ListCreateAPIView):
+    serializer_class = TicketAttachmentSerializer
+    parser_classes_override = None  # accept multipart from DRF defaults
+
+    def get_queryset(self):
+        return TicketAttachment.objects.filter(ticket__id=self.kwargs['ticket_id'])
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx['request'] = self.request
+        return ctx
+
+    def perform_create(self, serializer):
+        ticket = Ticket.objects.get(id=self.kwargs['ticket_id'])
+        serializer.save(ticket=ticket)
+
+
+class TicketAttachmentDetailView(generics.RetrieveDestroyAPIView):
+    serializer_class = TicketAttachmentSerializer
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        return TicketAttachment.objects.filter(ticket__id=self.kwargs['ticket_id'])
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx['request'] = self.request
+        return ctx
+
+    def perform_destroy(self, instance):
+        if instance.file:
+            instance.file.delete(save=False)
+        instance.delete()
+
+
+# ==================== TICKET RELATIONS ====================
+
+class TicketRelationListCreateView(generics.ListCreateAPIView):
+    serializer_class = TicketRelationSerializer
+
+    def get_queryset(self):
+        ticket_id = self.kwargs['ticket_id']
+        return TicketRelation.objects.filter(
+            Q(from_ticket__id=ticket_id) | Q(to_ticket__id=ticket_id)
+        ).select_related('from_ticket', 'to_ticket')
+
+    def perform_create(self, serializer):
+        ticket = Ticket.objects.get(id=self.kwargs['ticket_id'])
+        serializer.save(from_ticket=ticket)
+
+
+class TicketRelationDetailView(generics.RetrieveDestroyAPIView):
+    serializer_class = TicketRelationSerializer
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        return TicketRelation.objects.filter(from_ticket__id=self.kwargs['ticket_id'])
+
+
+# ==================== BULK ACTIONS ====================
+
+@api_view(['PATCH'])
+def ticket_bulk_update(request):
+    serializer = BulkUpdateSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    data = serializer.validated_data
+    ids = data['ids']
+    tickets = Ticket.objects.filter(id__in=ids)
+
+    update_fields = {}
+    if 'status' in data:
+        update_fields['status'] = data['status']
+    if 'priority' in data:
+        update_fields['priority'] = data['priority']
+
+    agent = None
+    if 'assigned_to_id' in data:
+        if data['assigned_to_id'] is None:
+            update_fields['assigned_to'] = None
+        else:
+            try:
+                agent = Agent.objects.get(id=data['assigned_to_id'])
+                update_fields['assigned_to'] = agent
+            except Agent.DoesNotExist:
+                return Response({'assigned_to_id': 'Agent not found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    updated_count = tickets.update(**update_fields)
+    return Response({'updated': updated_count})
+
+
+# ==================== PUBLIC STATUS PORTAL ====================
+
+@api_view(['GET'])
+def ticket_status_portal(request, ticket_number):
+    try:
+        ticket = (
+            Ticket.objects
+            .select_related('assigned_to__user', 'sla_config')
+            .prefetch_related('comments')
+            .get(ticket_number=ticket_number)
+        )
+    except Ticket.DoesNotExist:
+        return Response({'detail': 'Ticket not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    serializer = TicketStatusPortalSerializer(ticket, context={'request': request})
+    return Response(serializer.data)
 
 
 # ==================== AGENTS ====================
@@ -148,7 +288,6 @@ class AgentDetailView(generics.RetrieveUpdateAPIView):
 # ==================== CANNED RESPONSES ====================
 
 class CannedResponseListCreateView(generics.ListCreateAPIView):
-    queryset = CannedResponse.objects.filter(is_active=True)
     serializer_class = CannedResponseSerializer
 
     def get_queryset(self):
@@ -194,7 +333,7 @@ class UserListView(generics.ListAPIView):
 def dashboard_stats(request):
     now = timezone.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    
+
     total_tickets = Ticket.objects.count()
     open_tickets = Ticket.objects.filter(status='open').count()
     in_progress_tickets = Ticket.objects.filter(status='in_progress').count()
@@ -202,8 +341,7 @@ def dashboard_stats(request):
     resolved_today = Ticket.objects.filter(resolved_at__gte=today_start).count()
     sla_breached_count = Ticket.objects.filter(sla_breached=True).exclude(status='closed').count()
     sla_warning_count = Ticket.objects.filter(sla_warning=True).exclude(status__in=['closed', 'resolved']).count()
-    
-    # Average resolution time
+
     resolved_tickets = Ticket.objects.filter(resolved_at__isnull=False)
     avg_resolution = resolved_tickets.annotate(
         resolution_time=ExpressionWrapper(
@@ -211,13 +349,11 @@ def dashboard_stats(request):
             output_field=DurationField()
         )
     ).aggregate(avg=Avg('resolution_time'))
-    
-    avg_hours = None
+
+    avg_hours = 0.0
     if avg_resolution['avg']:
         avg_hours = round(avg_resolution['avg'].total_seconds() / 3600, 1)
-    else:
-        avg_hours = 0.0
-    
+
     data = {
         'total_tickets': total_tickets,
         'open_tickets': open_tickets,
@@ -248,14 +384,13 @@ def tickets_by_priority(request):
 
 @api_view(['GET'])
 def tickets_trend(request):
-    # Tickets created per day for the last 14 days
     days = int(request.query_params.get('days', 14))
     start_date = timezone.now() - timedelta(days=days)
-    
+
     queryset = Ticket.objects.filter(created_at__gte=start_date).annotate(
         date=TruncDate('created_at')
     ).values('date').annotate(count=Count('id')).order_by('date')
-    
+
     data = [{'date': str(item['date']), 'count': item['count']} for item in queryset]
     return Response(data)
 
@@ -264,13 +399,12 @@ def tickets_trend(request):
 def agent_performance(request):
     agents = Agent.objects.filter(is_active=True)
     result = []
-    
+
     for agent in agents:
         total = agent.assigned_tickets.count()
         resolved = agent.assigned_tickets.filter(status__in=['resolved', 'closed']).count()
         open_tix = agent.assigned_tickets.filter(status__in=['open', 'in_progress', 'pending']).count()
-        
-        # Average resolution time
+
         resolved_tix = agent.assigned_tickets.filter(resolved_at__isnull=False)
         avg_res = resolved_tix.annotate(
             resolution_time=ExpressionWrapper(
@@ -278,11 +412,11 @@ def agent_performance(request):
                 output_field=DurationField()
             )
         ).aggregate(avg=Avg('resolution_time'))
-        
+
         avg_hours = 0.0
         if avg_res['avg']:
             avg_hours = round(avg_res['avg'].total_seconds() / 3600, 1)
-        
+
         result.append({
             'agent_id': agent.id,
             'agent_name': agent.user.get_full_name() or agent.user.username,
@@ -291,7 +425,7 @@ def agent_performance(request):
             'avg_resolution_hours': avg_hours,
             'open_tickets': open_tix,
         })
-    
+
     serializer = AgentPerformanceSerializer(result, many=True)
     return Response(serializer.data)
 
@@ -306,12 +440,9 @@ def resolution_time_by_priority(request):
             )
         )
     )
-    
+
     result = []
     for item in queryset:
         hours = item['avg_hours'].total_seconds() / 3600 if item['avg_hours'] else 0
-        result.append({
-            'priority': item['priority'],
-            'avg_hours': round(hours, 1)
-        })
+        result.append({'priority': item['priority'], 'avg_hours': round(hours, 1)})
     return Response(result)

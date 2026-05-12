@@ -34,6 +34,8 @@ export interface Ticket {
   tags: string[];
   comments?: TicketComment[];
   activities?: TicketActivity[];
+  attachments?: TicketAttachment[];
+  relations?: { outgoing: TicketRelation[]; incoming: TicketRelation[] };
   comments_count?: number;
   sla_status?: 'ok' | 'warning' | 'breached';
   time_to_resolution?: number;
@@ -58,6 +60,29 @@ export interface TicketActivity {
   field_changed: string;
   old_value: string;
   new_value: string;
+  created_at: string;
+}
+
+export interface TicketAttachment {
+  id: string;
+  ticket: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  uploaded_by: string;
+  url: string;
+  created_at: string;
+}
+
+export interface TicketRelation {
+  id: string;
+  from_ticket: string;
+  from_ticket_number: string;
+  to_ticket: string;
+  to_ticket_number: string;
+  to_ticket_title: string;
+  to_ticket_status: string;
+  relation_type: 'related' | 'blocks' | 'blocked_by' | 'duplicates' | 'duplicated_by';
   created_at: string;
 }
 
@@ -133,6 +158,21 @@ export interface AgentPerformance {
   open_tickets: number;
 }
 
+export interface PublicTicketStatus {
+  ticket_number: string;
+  title: string;
+  status: string;
+  priority: string;
+  ticket_type: string;
+  requester_name: string;
+  assigned_to_name: string;
+  sla_deadline?: string;
+  sla_status: 'ok' | 'warning' | 'breached';
+  created_at: string;
+  updated_at: string;
+  public_comments: TicketComment[];
+}
+
 // API functions
 export const getDashboardStats = (): Promise<DashboardStats> =>
   api.get('/dashboard/stats/').then((r) => r.data);
@@ -161,11 +201,37 @@ export const createTicket = (data: Partial<Ticket>): Promise<Ticket> =>
 export const updateTicket = (id: string, data: Partial<Ticket>): Promise<Ticket> =>
   api.patch(`/tickets/${id}/`, data).then((r) => r.data);
 
+export const bulkUpdateTickets = (data: { ids: string[]; status?: string; priority?: string; assigned_to_id?: string | null }): Promise<{ updated: number }> =>
+  api.patch('/tickets/bulk/', data).then((r) => r.data);
+
+export const getTicketStatusPortal = (ticketNumber: string): Promise<PublicTicketStatus> =>
+  api.get(`/tickets/status/${ticketNumber}/`).then((r) => r.data);
+
 export const getTicketComments = (ticketId: string): Promise<TicketComment[]> =>
   api.get(`/tickets/${ticketId}/comments/`).then((r) => r.data);
 
 export const addTicketComment = (ticketId: string, data: Partial<TicketComment>): Promise<TicketComment> =>
   api.post(`/tickets/${ticketId}/comments/`, data).then((r) => r.data);
+
+export const getTicketAttachments = (ticketId: string): Promise<TicketAttachment[]> =>
+  api.get(`/tickets/${ticketId}/attachments/`).then((r) => r.data);
+
+export const uploadTicketAttachment = (ticketId: string, formData: FormData): Promise<TicketAttachment> =>
+  api.post(`/tickets/${ticketId}/attachments/`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  }).then((r) => r.data);
+
+export const deleteTicketAttachment = (ticketId: string, attachmentId: string): Promise<void> =>
+  api.delete(`/tickets/${ticketId}/attachments/${attachmentId}/`).then((r) => r.data);
+
+export const getTicketRelations = (ticketId: string): Promise<TicketRelation[]> =>
+  api.get(`/tickets/${ticketId}/relations/`).then((r) => r.data);
+
+export const createTicketRelation = (ticketId: string, data: { to_ticket_id: string; relation_type: string }): Promise<TicketRelation> =>
+  api.post(`/tickets/${ticketId}/relations/`, data).then((r) => r.data);
+
+export const deleteTicketRelation = (ticketId: string, relationId: string): Promise<void> =>
+  api.delete(`/tickets/${ticketId}/relations/${relationId}/`).then((r) => r.data);
 
 export const getAgents = (): Promise<Agent[]> =>
   api.get('/agents/').then((r) => r.data);
