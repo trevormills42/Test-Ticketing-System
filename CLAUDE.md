@@ -17,10 +17,12 @@ npm run lint      # ESLint
 
 All backend commands run from `app/backend/`:
 ```bash
-python3 manage.py runserver 0.0.0.0:8000   # Start API server on port 8000
-python3 manage.py migrate                   # Apply migrations
-python3 manage.py test                      # Run Django tests
-python3 manage.py test api                  # Run tests for a single app
+python3 manage.py runserver 0.0.0.0:8000      # Start API server on port 8000
+python3 manage.py migrate                      # Apply migrations
+python3 manage.py test                         # Run Django tests
+python3 manage.py test api                     # Run tests for a single app
+python3 manage.py update_sla_statuses          # Recompute SLA flags for open tickets (run on a schedule)
+pip install -r requirements.txt                # Install Python dependencies
 ```
 
 Or use the helper script from `app/`:
@@ -31,6 +33,11 @@ bash start-backend.sh   # Starts backend; default login admin / admin123
 Seed the database with sample data (run from `app/backend/`):
 ```bash
 python3 seed_data.py   # Wipes all non-superuser data and recreates it
+```
+
+Environment configuration (run from `app/backend/`):
+```bash
+cp .env.example .env   # Create local env file, then edit values
 ```
 
 ## Architecture
@@ -61,12 +68,16 @@ There are two Django apps with a deliberate split of responsibility:
 
 **Key serializer pattern**: `Ticket` has three serializers — `TicketListSerializer` (lightweight, for list view), `TicketDetailSerializer` (full nested data including comments/activities, with writable `assigned_to_id`), and `TicketCreateSerializer`. `TicketListCreateView.get_serializer_class()` switches between them by HTTP method.
 
+**SLA status** is computed live from `sla_deadline` vs `now()` in `_compute_sla_status()` in `api/serializers.py` — never read from stored booleans for display. The stored `sla_breached`/`sla_warning` flags are kept in sync via `Ticket.compute_sla_fields()` (called on every `save()`) and the `update_sla_statuses` management command (for tickets that haven't been saved since their deadline passed). The `?sla_status=breached` filter in the tickets list uses `sla_deadline__lt=now()` directly; `?sla_status=warning` uses the stored flag.
+
+**Ticket numbers** (`TKT-XXXXX`) are generated with a `TicketCounter` single-row table locked via `SELECT FOR UPDATE` inside a transaction, replacing the previous race-prone `count()+1` approach.
+
 **Automatic side effects** in views:
 - `Ticket.save()` auto-generates `ticket_number` as `TKT-XXXXX` on first save.
 - `TicketDetailView.perform_update()` creates `TicketActivity` records when `status` or `assigned_to` changes.
 - `TicketCommentListCreateView.perform_create()` sets `first_responded_at` on the ticket if it hasn't been set.
 
-**Django settings**: SQLite database (`db.sqlite3` in `app/backend/`), `CORS_ALLOW_ALL_ORIGINS = True`, `AllowAny` DRF permission class, `PageNumberPagination` with `PAGE_SIZE = 20`.
+**Django settings**: configured via `django-environ`. `DATABASE_URL` env var selects the database (defaults to SQLite at `app/backend/db.sqlite3`; set to a `postgres://` URL for production). `SECRET_KEY`, `DEBUG`, and `ALLOWED_HOSTS` are also env-driven. See `app/backend/.env.example`. `CORS_ALLOW_ALL_ORIGINS = True`, `AllowAny` DRF permission class, `PageNumberPagination` with `PAGE_SIZE = 20`.
 
 ### Data Model Relationships
 

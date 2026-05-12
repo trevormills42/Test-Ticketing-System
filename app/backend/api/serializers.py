@@ -1,6 +1,30 @@
 from rest_framework import serializers
+from django.utils import timezone
+from datetime import timedelta
 from tickets.models import Ticket, TicketComment, TicketActivity, Agent, CannedResponse, SLAConfig
 from django.contrib.auth.models import User
+
+
+def _compute_sla_status(sla_deadline, status, sla_config):
+    """Return 'breached' | 'warning' | 'ok' computed from the current time.
+
+    Uses the live deadline rather than stored boolean flags so the value is
+    always accurate regardless of when the ticket was last saved.
+    """
+    if not sla_deadline or status in ('resolved', 'closed'):
+        return 'ok'
+
+    now = timezone.now()
+    if now > sla_deadline:
+        return 'breached'
+
+    if sla_config:
+        warn_minutes = sla_config.resolution_time_minutes * (1 - sla_config.warning_threshold_percent / 100)
+        warn_boundary = sla_deadline - timedelta(minutes=warn_minutes)
+        if now > warn_boundary:
+            return 'warning'
+
+    return 'ok'
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -18,7 +42,7 @@ class AgentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Agent
-        fields = ['id', 'user', 'role', 'department', 'phone', 'is_active', 
+        fields = ['id', 'user', 'role', 'department', 'phone', 'is_active',
                   'ticket_count', 'open_ticket_count', 'created_at']
 
     def get_ticket_count(self, obj):
@@ -38,7 +62,7 @@ class SLAConfigSerializer(serializers.ModelSerializer):
 class TicketCommentSerializer(serializers.ModelSerializer):
     class Meta:
         model = TicketComment
-        fields = ['id', 'ticket', 'author_name', 'author_email', 'is_internal', 
+        fields = ['id', 'ticket', 'author_name', 'author_email', 'is_internal',
                   'content', 'created_at']
         read_only_fields = ['ticket', 'created_at']
 
@@ -46,12 +70,12 @@ class TicketCommentSerializer(serializers.ModelSerializer):
 class TicketActivitySerializer(serializers.ModelSerializer):
     class Meta:
         model = TicketActivity
-        fields = ['id', 'ticket', 'actor_name', 'field_changed', 'old_value', 
+        fields = ['id', 'ticket', 'actor_name', 'field_changed', 'old_value',
                   'new_value', 'created_at']
 
 
 class TicketListSerializer(serializers.ModelSerializer):
-    assigned_to_name = serializers.CharField(source='assigned_to.user.get_full_name', 
+    assigned_to_name = serializers.CharField(source='assigned_to.user.get_full_name',
                                               read_only=True, default='')
     assigned_to_id = serializers.UUIDField(source='assigned_to.id', read_only=True, default=None)
     comments_count = serializers.SerializerMethodField()
@@ -68,11 +92,8 @@ class TicketListSerializer(serializers.ModelSerializer):
         return obj.comments.count()
 
     def get_sla_status(self, obj):
-        if obj.sla_breached:
-            return 'breached'
-        elif obj.sla_warning:
-            return 'warning'
-        return 'ok'
+        # sla_config is available via select_related in TicketListCreateView.get_queryset()
+        return _compute_sla_status(obj.sla_deadline, obj.status, obj.sla_config if obj.sla_config_id else None)
 
 
 class TicketDetailSerializer(serializers.ModelSerializer):
@@ -86,25 +107,20 @@ class TicketDetailSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Ticket
-        fields = ['id', 'ticket_number', 'title', 'description', 'status', 'priority', 
+        fields = ['id', 'ticket_number', 'title', 'description', 'status', 'priority',
                   'ticket_type', 'requester_name', 'requester_email', 'requester_phone',
-                  'assigned_to', 'assigned_to_id', 'created_by', 'sla_config', 
+                  'assigned_to', 'assigned_to_id', 'created_by', 'sla_config',
                   'sla_deadline', 'sla_breached', 'sla_warning', 'first_responded_at',
                   'resolved_at', 'source', 'tags', 'comments', 'activities',
                   'sla_status', 'time_to_resolution', 'created_at', 'updated_at']
 
     def get_sla_status(self, obj):
-        if obj.sla_breached:
-            return 'breached'
-        elif obj.sla_warning:
-            return 'warning'
-        return 'ok'
+        return _compute_sla_status(obj.sla_deadline, obj.status, obj.sla_config if obj.sla_config_id else None)
 
     def get_time_to_resolution(self, obj):
         if obj.resolved_at and obj.created_at:
             delta = obj.resolved_at - obj.created_at
-            hours = delta.total_seconds() / 3600
-            return round(hours, 1)
+            return round(delta.total_seconds() / 3600, 1)
         return None
 
     def update(self, instance, validated_data):
@@ -117,7 +133,7 @@ class TicketDetailSerializer(serializers.ModelSerializer):
                 pass
         elif assigned_to_id is None and 'assigned_to_id' in self.initial_data:
             instance.assigned_to = None
-        
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -136,7 +152,7 @@ class TicketCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         assigned_to_id = validated_data.pop('assigned_to_id', None)
         ticket = Ticket.objects.create(**validated_data)
-        
+
         if assigned_to_id:
             try:
                 agent = Agent.objects.get(id=assigned_to_id)
@@ -144,14 +160,14 @@ class TicketCreateSerializer(serializers.ModelSerializer):
                 ticket.save()
             except Agent.DoesNotExist:
                 pass
-        
+
         return ticket
 
 
 class CannedResponseSerializer(serializers.ModelSerializer):
     class Meta:
         model = CannedResponse
-        fields = ['id', 'title', 'content', 'category', 'is_active', 
+        fields = ['id', 'title', 'content', 'category', 'is_active',
                   'created_at', 'updated_at']
 
 
