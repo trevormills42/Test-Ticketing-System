@@ -1,6 +1,16 @@
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth.models import User
+from django.utils import timezone
+from datetime import timedelta
 import uuid
+
+
+class TicketCounter(models.Model):
+    """Single-row counter used to generate collision-free ticket numbers."""
+    value = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = 'ticket_counter'
 
 
 class Agent(models.Model):
@@ -70,6 +80,8 @@ class Ticket(models.Model):
         ('change', 'Change'),
     ]
 
+    CLOSED_STATUSES = {'resolved', 'closed'}
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     ticket_number = models.CharField(max_length=20, unique=True, editable=False)
     title = models.CharField(max_length=255)
@@ -77,24 +89,24 @@ class Ticket(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='medium')
     ticket_type = models.CharField(max_length=20, choices=TICKET_TYPE_CHOICES, default='incident')
-    
+
     requester_name = models.CharField(max_length=150)
     requester_email = models.EmailField()
     requester_phone = models.CharField(max_length=50, blank=True, default='')
-    
+
     assigned_to = models.ForeignKey(Agent, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_tickets')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_tickets')
-    
+
     sla_config = models.ForeignKey(SLAConfig, on_delete=models.SET_NULL, null=True, blank=True)
     sla_deadline = models.DateTimeField(null=True, blank=True)
     sla_breached = models.BooleanField(default=False)
     sla_warning = models.BooleanField(default=False)
     first_responded_at = models.DateTimeField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
-    
+
     source = models.CharField(max_length=50, default='web', blank=True)
     tags = models.JSONField(default=list, blank=True)
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -105,10 +117,45 @@ class Ticket(models.Model):
     def __str__(self):
         return f"{self.ticket_number}: {self.title}"
 
+    def compute_sla_fields(self):
+        """Recompute sla_breached and sla_warning from the current time and deadline.
+
+        Called on every save so stored flags stay accurate without a background job.
+        The management command `update_sla_statuses` handles tickets that haven't
+        been touched since their deadline passed.
+        """
+        if not self.sla_deadline or self.status in self.CLOSED_STATUSES:
+            self.sla_breached = False
+            self.sla_warning = False
+            return
+
+        now = timezone.now()
+        self.sla_breached = now > self.sla_deadline
+
+        if self.sla_breached:
+            self.sla_warning = False
+            return
+
+        # sla_config_id check avoids a DB round-trip when no config is attached
+        if self.sla_config_id:
+            config = self.sla_config
+            warn_minutes = config.resolution_time_minutes * (1 - config.warning_threshold_percent / 100)
+            warn_boundary = self.sla_deadline - timedelta(minutes=warn_minutes)
+            self.sla_warning = now > warn_boundary
+        else:
+            self.sla_warning = False
+
     def save(self, *args, **kwargs):
         if not self.ticket_number:
-            count = Ticket.objects.count() + 1
-            self.ticket_number = f"TKT-{count:05d}"
+            with transaction.atomic():
+                counter, _ = TicketCounter.objects.select_for_update().get_or_create(
+                    pk=1, defaults={'value': 0}
+                )
+                counter.value += 1
+                counter.save(update_fields=['value'])
+                self.ticket_number = f"TKT-{counter.value:05d}"
+
+        self.compute_sla_fields()
         super().save(*args, **kwargs)
 
 

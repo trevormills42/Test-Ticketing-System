@@ -58,13 +58,18 @@ class TicketListCreateView(generics.ListCreateAPIView):
             queryset = queryset.filter(ticket_type=ticket_type)
         
         # Filter SLA status
+        # 'breached' is computed from the live deadline; 'warning' relies on the
+        # stored flag (kept current by Ticket.save() and update_sla_statuses).
         sla_status = self.request.query_params.get('sla_status')
         if sla_status == 'breached':
-            queryset = queryset.filter(sla_breached=True)
+            queryset = queryset.filter(
+                sla_deadline__isnull=False,
+                sla_deadline__lt=timezone.now(),
+            ).exclude(status__in=['resolved', 'closed'])
         elif sla_status == 'warning':
-            queryset = queryset.filter(sla_warning=True)
-        
-        return queryset.select_related('assigned_to__user').prefetch_related('comments')
+            queryset = queryset.filter(sla_warning=True).exclude(status__in=['resolved', 'closed'])
+
+        return queryset.select_related('assigned_to__user', 'sla_config').prefetch_related('comments')
 
 
 class TicketDetailView(generics.RetrieveUpdateDestroyAPIView):
